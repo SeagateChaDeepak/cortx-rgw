@@ -1082,7 +1082,7 @@ int MotrBucket::list_multiparts(const DoutPrefixProvider *dpp,
   rgw_obj_key last_obj_key;
   *is_truncated = false;
 
-   for (auto& bl : val_vec) {
+  for (const auto& bl: val_vec) {
     
     if (bl.length() == 0)
       continue;
