@@ -897,9 +897,8 @@ int MotrBucket::check_quota(const DoutPrefixProvider *dpp, RGWQuotaInfo& user_qu
 
 int MotrBucket::merge_and_store_attrs(const DoutPrefixProvider *dpp, Attrs& new_attrs, optional_yield y)
 {
-  for (auto& it : new_attrs)
-    attrs[it.first] = it.second;
-
+  // Assign updated bucket attributes map to attrs map variable
+  attrs = new_attrs;
   // "put_info" second bool argument is meant to update existing metadata,
   // which is not needed here. So explicitly passing false.
   return put_info(dpp, false, ceph::real_time());
@@ -2091,46 +2090,72 @@ int MotrObject::get_bucket_dir_ent(const DoutPrefixProvider *dpp, rgw_bucket_dir
   if (this->get_bucket()->get_info().versioning_status() == BUCKET_VERSIONED ||
       this->get_bucket()->get_info().versioning_status() == BUCKET_SUSPENDED) {
 
-    rgw_bucket_dir_entry ent_to_check;
-
+    // Check entry in the cache
     if (this->store->get_obj_meta_cache()->get(dpp, this->get_name(), bl) == 0) {
-      iter = bl.cbegin();
-      ent_to_check.decode(iter);
-      if (ent_to_check.is_current()) {
-        ent = ent_to_check;
+        iter = bl.cbegin();
+        ent.decode(iter);
         rc = 0;
         goto out;
+    }
+
+    if(this->have_instance())
+    {
+      // TODO : Handle null version-id scenarios
+
+      // Cache miss.
+      rc = this->store->do_idx_op_by_name(bucket_index_iname,
+                          M0_IC_GET, this->get_key().to_str(), bl);
+      if(rc < 0) {
+        ldpp_dout(dpp, 0) << __func__ << " ERROR: do_idx_op_by_name failed to get object's entry: rc="
+                          << rc << dendl;
+        return rc;
       }
-    }
-
-    ldpp_dout(dpp, 20) <<__func__<< ": versioned bucket!" << dendl;
-    keys[0] = this->get_name();
-    rc = store->next_query_by_name(bucket_index_iname, keys, vals);
-    if (rc < 0) {
-      ldpp_dout(dpp, 0) << __func__ << "ERROR: NEXT query failed. " << rc << dendl;
-      return rc;
-    }
-
-    rc = -ENOENT;
-    for (const auto& bl: vals) {
-      if (bl.length() == 0)
-        break;
 
       iter = bl.cbegin();
-      ent_to_check.decode(iter);
-      if (ent_to_check.is_current()) {
-        ldpp_dout(dpp, 20) <<__func__<< ": found current version!" << dendl;
-        ent = ent_to_check;
-        rc = 0;
+      ent.decode(iter);
+      rc = 0;
+      // Put into the cache
+      this->store->get_obj_meta_cache()->put(dpp, this->get_name(), bl);
+      goto out;
 
-        this->store->get_obj_meta_cache()->put(dpp, this->get_name(), bl);
-
-        break;
-      }
     }
-  } else {
-    if (this->store->get_obj_meta_cache()->get(dpp, this->get_key().to_str(), bl)) {
+    else
+    {  // Version-id instance is empty
+       // Cache miss.
+        keys[0] = this->get_name();
+
+        // Retrieve all 'max' number of pairs.
+        rc = store->next_query_by_name(bucket_index_iname, keys, vals, this->get_name());
+        if (rc < 0) {
+          ldpp_dout(dpp, 0) << __func__ << "ERROR: NEXT query failed. " << rc << dendl;
+          return rc;
+        }
+
+        rc = -ENOENT;
+
+        // Iterating on object keys and return the latest object version
+        for (const auto& bl: vals) {
+          if (bl.length() == 0)
+            break;
+
+          iter = bl.cbegin();
+          ent.decode(iter);
+
+          if (ent.is_current()) {
+            ldpp_dout(dpp, 20) <<__func__<< ": found current version!" << dendl;
+            rc = 0;
+            // Put into the cache
+            this->store->get_obj_meta_cache()->put(dpp, this->get_name(), bl);
+            break;
+          }
+        }
+     }
+    } else {
+    if (this->store->get_obj_meta_cache()->get(dpp, this->get_name(), bl)) {
       ldpp_dout(dpp, 20) <<__func__<< ": non-versioned bucket!" << dendl;
+
+      // TODO : Handle null version-id scenarios
+
       rc = this->store->do_idx_op_by_name(bucket_index_iname,
                                           M0_IC_GET, this->get_key().to_str(), bl);
       if (rc < 0) {
@@ -3695,13 +3720,25 @@ int MotrStore::list_users(const DoutPrefixProvider* dpp, const std::string& meta
                         bool* truncated, std::list<std::string>& users)
 {
   int rc;
+  bufferlist bl;
   if (max_entries <= 0 or max_entries > 1000) {
     max_entries = 1000; 
   }
   vector<string> keys(max_entries + 1);
   vector<bufferlist> vals(max_entries + 1);
+  
+  if(!(marker.empty())){
+    rc = do_idx_op_by_name(RGW_MOTR_USERS_IDX_NAME,
+                                  M0_IC_GET, marker, bl);
+    if (rc < 0) {
+      ldpp_dout(dpp, 0) << "ERROR: Invalid marker. " << rc << dendl;
+      return rc;
+    }
+    else {
+      keys[0] = marker;
+    }
+  }
 
-  keys[0] = marker;
   rc = next_query_by_name(RGW_MOTR_USERS_IDX_NAME, keys, vals);
   if (rc < 0) {
     ldpp_dout(dpp, 0) << "ERROR: NEXT query failed. " << rc << dendl;
