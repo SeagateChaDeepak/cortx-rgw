@@ -125,6 +125,9 @@ static std::string motr_global_indices[] = {
 #define TS_LEN 8
 #define UUID_LEN 23
 
+// Use NULL_REF macro for handling null object reference entry
+#define NULL_REF "^null"
+
 static uint64_t roundup(uint64_t x, uint64_t by)
 {
   if (x == 0)
@@ -873,7 +876,7 @@ int MotrBucket::remove_bucket(const DoutPrefixProvider *dpp, bool delete_childre
                       << " bucket = " << tenant_bkt_name << dendl;
 
   // 5. Remove the bucket from user info index. (unlink user)
-  ret = this->unlink_user(dpp, owner, y);
+  ret = this->unlink_user(dpp, info.owner, y);
   if (ret < 0) {
     ldpp_dout(dpp, 0) << __func__ << ": ERROR: unlink_user failed rc = " << ret << dendl;
     return ret;
@@ -1018,12 +1021,12 @@ int MotrBucket::link_user(const DoutPrefixProvider* dpp, User* new_user, optiona
 
 }
 
-int MotrBucket::unlink_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y)
+int MotrBucket::unlink_user(const DoutPrefixProvider* dpp, const rgw_user &bucket_owner, optional_yield y)
 {
   // Remove the user into the user info index.
   bufferlist bl;
   string tenant_bkt_name = get_bucket_name(info.bucket.tenant, info.bucket.name);
-  string user_info_idx_name = "motr.rgw.user.info." + new_user->get_info().user_id.to_str();
+  string user_info_idx_name = "motr.rgw.user.info." + bucket_owner.id;
   return store->do_idx_op_by_name(user_info_idx_name,
                                   M0_IC_DEL, tenant_bkt_name, bl);
 }
@@ -1258,7 +1261,7 @@ int MotrBucket::list(const DoutPrefixProvider *dpp, ListParams& params, int max,
     else
       keys[0].append(" ");
   }
-
+  
   results.is_truncated = false;
   int keycount=0;
   std::string next_key;
@@ -1285,7 +1288,7 @@ int MotrBucket::list(const DoutPrefixProvider *dpp, ListParams& params, int max,
         rgw_bucket_dir_entry ent;
         auto iter = vals[i].cbegin();
         ent.decode(iter);
-        std::string null_ref_key = ent.key.name + "/null";
+        std::string null_ref_key = ent.key.name + NULL_REF;
         if(keys[i] == null_ref_key){
           ldpp_dout(dpp, 70) << __func__ << ": skipping key "<<keys[i]<<dendl;
             continue;
@@ -1776,6 +1779,13 @@ int MotrObject::MotrReadOp::prepare(optional_yield y, const DoutPrefixProvider* 
   if (rc < 0)
     return rc;
 
+  // In case of un-versioned/suspended case,
+  // GET and HEAD object output should ignore versiodId field.
+  if (!source->have_instance()) {
+    if (ent.key.instance == "null")
+      ent.key.instance.clear();
+  }
+
   // Set source object's attrs. The attrs is key/value map and is used
   // in send_response_data() to set attributes, including etag.
   bufferlist etag_bl;
@@ -1914,7 +1924,7 @@ int MotrObject::MotrDeleteOp::delete_obj(const DoutPrefixProvider* dpp, optional
   string tenant_bkt_name = get_bucket_name(source->get_bucket()->get_tenant(), source->get_bucket()->get_name());
   string bucket_index_iname = "motr.rgw.bucket.index." + tenant_bkt_name;
   std::string delete_key;
-  std::string null_ref_key = source->get_name() + "/null"; 
+  std::string null_ref_key = source->get_name() + NULL_REF;
   bool del_null_ref_key = false;
   rgw_bucket_dir_entry ent;
   RGWBucketInfo &info = source->get_bucket()->get_info();
@@ -2958,13 +2968,13 @@ out:
   return rc;
 }
 
-int MotrObject::fetch_null_obj_reference(const DoutPrefixProvider *dpp, std::string& prev_null_obj_key)
+int MotrObject::fetch_null_obj_reference(const DoutPrefixProvider *dpp, std::string& prev_null_obj_key, bool raise_error)
 {
   int rc = 0;
   // Read the null index entry
   string tenant_bkt_name = get_bucket_name(this->get_bucket()->get_tenant(), this->get_bucket()->get_name());
   string bucket_index_iname = "motr.rgw.bucket.index." + tenant_bkt_name;
-  std::string null_ref_key = this->get_name() + "/null";
+  std::string null_ref_key = this->get_name() + NULL_REF;
   bufferlist bl;
   bufferlist::const_iterator iter;
   rgw_bucket_dir_entry ent_null_ref;
@@ -2974,12 +2984,13 @@ int MotrObject::fetch_null_obj_reference(const DoutPrefixProvider *dpp, std::str
     rc = this->store->do_idx_op_by_name(bucket_index_iname,
                               M0_IC_GET, null_ref_key, bl);
     ldpp_dout(dpp, 20) <<__func__<< ":  GET null index entry "<< null_ref_key <<", rc = "<< rc << dendl;
-    //  first put there will be no null ref entry present in bucket and rc = -ENOENT.
-    if (rc == -ENOENT){
+    // For the first put-object, null ref entry will not be present in the bucket and rc = -ENOENT.
+    // Handle motr return code for above scenario.
+    if (rc == -ENOENT && raise_error == false) {
       rc = 0;
       return rc;
     }
-    if (rc < 0){
+    if (rc < 0) {
       ldpp_dout(dpp, 0) << __func__ << ": ERROR: Failed to get key- "<< null_ref_key <<"from index rc=" << rc << dendl;
       return rc;
     }
@@ -2991,7 +3002,7 @@ int MotrObject::fetch_null_obj_reference(const DoutPrefixProvider *dpp, std::str
   return rc;
 }
 
-int MotrObject::fetch_null_obj(const DoutPrefixProvider *dpp, bufferlist& bl)
+int MotrObject::fetch_null_obj(const DoutPrefixProvider *dpp, bufferlist& bl, bool raise_error)
 {
   int rc = 0;
   string tenant_bkt_name = get_bucket_name(this->get_bucket()->get_tenant(), this->get_bucket()->get_name());
@@ -3000,7 +3011,7 @@ int MotrObject::fetch_null_obj(const DoutPrefixProvider *dpp, bufferlist& bl)
 
   // Get content of the key and replace it's instance with null
   // then add into cache
-  rc = this->fetch_null_obj_reference(dpp, null_obj_key);
+  rc = this->fetch_null_obj_reference(dpp, null_obj_key, raise_error);
   if (rc < 0)
      return rc;
   // 1st put, no null reference entry present in bucket.
@@ -3142,6 +3153,10 @@ int MotrObject::update_version_entries(const DoutPrefixProvider *dpp, bool set_i
   
     auto iter = vals[i].cbegin();
     ent.decode(iter);
+
+    std::string null_ref_key = ent.key.name + NULL_REF;
+    if(keys[i] == null_ref_key)
+      continue;
 
     if (0 != ent.key.name.compare(0, this->get_name().size(), this->get_name()))
       continue;
@@ -3508,7 +3523,7 @@ int MotrObject::update_null_reference(const DoutPrefixProvider *dpp, rgw_bucket_
   string tenant_bkt_name = get_bucket_name(this->get_bucket()->get_tenant(), this->get_bucket()->get_name());
 
   string bucket_index_iname = "motr.rgw.bucket.index." + tenant_bkt_name;
-  std::string null_ref_key = this->get_name() + "/null";
+  std::string null_ref_key = this->get_name() + NULL_REF;
   bufferlist::const_iterator iter;
   bufferlist bl_null_idx_val;
   rgw_bucket_dir_entry current_null_key_ref;
@@ -3516,9 +3531,8 @@ int MotrObject::update_null_reference(const DoutPrefixProvider *dpp, rgw_bucket_
   current_null_key_ref.key.name = this->get_name();
   current_null_key_ref.key.instance = this->get_instance();
   current_null_key_ref.encode(bl_null_idx_val);
-
   // add new null entry to the motr
-  // (key:{obj1/null}, value:{obj1[v123]}) (this is null object version)
+  // (key:{obj1^null}, value:{obj1[v123]}) (this is null object version)
   rc = this->store->do_idx_op_by_name(bucket_index_iname,
                             M0_IC_PUT, null_ref_key, bl_null_idx_val);  
   if(rc < 0)
@@ -3539,14 +3553,15 @@ int MotrObject::overwrite_null_obj(const DoutPrefixProvider *dpp)
   std::string obj_type = "simple object";
   rgw_bucket_dir_entry old_ent;
   bufferlist old_check_bl;
-  rc = this->fetch_null_obj(dpp, old_check_bl);
+  bool raise_error = false;
+  rc = this->fetch_null_obj(dpp, old_check_bl, raise_error);
   if (rc < 0) {
     ldpp_dout(dpp, 0) <<__func__<< ": Failed to fetch null object, rc : " << rc << dendl;
     return rc;
   }
   //TODO: Remove this call in optimization tkt CORTX-31977
   std::string null_obj_key;
-  rc = this->fetch_null_obj_reference(dpp, null_obj_key);
+  rc = this->fetch_null_obj_reference(dpp, null_obj_key, raise_error);
   if (rc < 0) {
     ldpp_dout(dpp, 0) <<__func__<< ": Failed to fetch null reference key, rc : " << rc << dendl;
     return rc;
@@ -3613,9 +3628,14 @@ int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
   ent.meta.etag = etag;
   ent.meta.owner = owner.to_str();
   ent.meta.owner_display_name = obj.get_bucket()->get_owner()->get_display_name();
-  uint64_t lid = M0_OBJ_LAYOUT_ID(obj.meta.layout_id);
-  uint64_t unit_sz = m0_obj_layout_id_to_unit_size(lid);
-  uint64_t size_rounded = roundup(ent.meta.size, unit_sz);
+  uint64_t size_rounded = 0;
+  // For 0kb Object layout_id will not be available.
+  if(ent.meta.size != 0)
+  {
+    uint64_t lid = M0_OBJ_LAYOUT_ID(obj.meta.layout_id);
+    uint64_t unit_sz = m0_obj_layout_id_to_unit_size(lid);
+    size_rounded = roundup(ent.meta.size, unit_sz);
+  }
   RGWBucketInfo &info = obj.get_bucket()->get_info();
 
   // Set version and current flag in case of both versioning enabled and suspended case.
@@ -3648,7 +3668,6 @@ int MotrAtomicWriter::complete(size_t accounted_size, const std::string& etag,
   obj.meta.encode(bl);
   ldpp_dout(dpp, 20) <<__func__<< ": lid=0x" << std::hex << obj.meta.layout_id
                                                            << dendl;
-
   // Update existing object version entries in a bucket,
   // in case of both versioning enabled and suspended.
   if (info.versioned()) {
@@ -4481,9 +4500,14 @@ int MotrMultipartWriter::complete(size_t accounted_size, const std::string& etag
   info.num = part_num;
   info.etag = etag;
   info.size = actual_part_size;
-  uint64_t lid = M0_OBJ_LAYOUT_ID(part_obj->meta.layout_id);
-  uint64_t unit_sz = m0_obj_layout_id_to_unit_size(lid);
-  uint64_t size_rounded = roundup(info.size, unit_sz);
+  uint64_t size_rounded = 0;
+  //For 0kb Object layout_id will not be available. 
+  if(info.size != 0)
+  {
+    uint64_t lid = M0_OBJ_LAYOUT_ID(part_obj->meta.layout_id);
+    uint64_t unit_sz = m0_obj_layout_id_to_unit_size(lid);
+    size_rounded = roundup(info.size, unit_sz);
+  }
   info.size_rounded = size_rounded;
   info.accounted_size = accounted_size;
   info.modified = real_clock::now();

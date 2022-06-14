@@ -360,7 +360,7 @@ class MotrBucket : public Bucket {
     virtual int set_acl(const DoutPrefixProvider *dpp, RGWAccessControlPolicy& acl, optional_yield y) override;
     virtual int load_bucket(const DoutPrefixProvider *dpp, optional_yield y, bool get_stats = false) override;
     int link_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y);
-    int unlink_user(const DoutPrefixProvider* dpp, User* new_user, optional_yield y);
+    int unlink_user(const DoutPrefixProvider* dpp, const rgw_user &bucket_owner, optional_yield y);
     int create_bucket_index();
     int create_multipart_indices();
     virtual int read_stats(const DoutPrefixProvider *dpp, int shard_id,
@@ -733,8 +733,9 @@ class MotrObject : public Object {
     int delete_part_objs(const DoutPrefixProvider* dpp, uint64_t* size_rounded);
     void set_category(RGWObjCategory _category) {category = _category;}
     int get_bucket_dir_ent(const DoutPrefixProvider *dpp, rgw_bucket_dir_entry& ent);
-    int fetch_null_obj(const DoutPrefixProvider *dpp, bufferlist& bl);
-    int fetch_null_obj_reference(const DoutPrefixProvider *dpp, std::string& prev_null_obj_key);
+    int fetch_null_obj(const DoutPrefixProvider *dpp, bufferlist& bl, bool raise_error=true);
+    int fetch_null_obj_reference(
+      const DoutPrefixProvider *dpp, std::string& prev_null_obj_key, bool raise_error=true);
     int update_null_reference(const DoutPrefixProvider *dpp, rgw_bucket_dir_entry& ent);
     int update_version_entries(const DoutPrefixProvider *dpp, bool set_is_latest=false);
     int overwrite_null_obj(const DoutPrefixProvider *dpp);
